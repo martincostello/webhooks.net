@@ -2,6 +2,7 @@ namespace Octokit.Webhooks;
 
 using System.Collections.Concurrent;
 using System.Collections.Frozen;
+using System.IO;
 using System.Reflection;
 using System.Text;
 using System.Threading;
@@ -292,6 +293,41 @@ public abstract class WebhookEventProcessor
         }
 
         return (WebhookEvent)JsonSerializer.Deserialize(body, type)!;
+    }
+
+    /// <summary>
+    /// Deserializes a GitHub webhook event from a stream without dispatching it, avoiding buffering the entire body.
+    /// Falls back to reading the stream as a string when string-based method overrides are detected on the concrete type.
+    /// </summary>
+    /// <param name="headers">The parsed webhook headers.</param>
+    /// <param name="body">A stream containing the raw UTF-8 request body.</param>
+    /// <param name="cancellationToken">A cancellation token.</param>
+    /// <returns>The deserialized <see cref="WebhookEvent"/>.</returns>
+    [PublicAPI]
+    public virtual async ValueTask<WebhookEvent> DeserializeWebhookEventAsync(WebhookHeaders headers, Stream body, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(headers);
+        ArgumentNullException.ThrowIfNull(body);
+
+        if (string.IsNullOrWhiteSpace(headers.Event))
+        {
+            throw new JsonException($"Unable to deserialize event: '{headers.Event}'");
+        }
+
+        if (this.HasStringPathOverrides())
+        {
+            // Fall back to the string path to preserve any string-based overrides on the concrete type.
+            using var reader = new StreamReader(body, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
+            var bodyString = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+            return this.DeserializeWebhookEvent(headers, bodyString);
+        }
+
+        if (!EventTypeMap.TryGetValue(headers.Event, out var type))
+        {
+            throw new JsonException($"Unable to deserialize event: '{headers.Event}'");
+        }
+
+        return (WebhookEvent)(await JsonSerializer.DeserializeAsync(body, type, cancellationToken: cancellationToken).ConfigureAwait(false))!;
     }
 
     /// <summary>

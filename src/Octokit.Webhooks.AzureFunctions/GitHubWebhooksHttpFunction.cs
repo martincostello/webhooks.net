@@ -1,10 +1,13 @@
 namespace Octokit.Webhooks.AzureFunctions;
 
 using System;
+using System.Buffers;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Mime;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.Functions.Worker;
@@ -40,37 +43,72 @@ public sealed partial class GitHubWebhooksHttpFunction(IOptions<GitHubWebhooksOp
             return req.CreateResponse(HttpStatusCode.BadRequest);
         }
 
+        IncrementalHash? hmac = null;
         try
         {
-            var body = await GetBodyBytesAsync(req, ctx.CancellationToken).ConfigureAwait(false);
+            _ = req.Headers.TryGetValues("X-Hub-Signature-256", out var signatureValues);
+            var signatureHeader = signatureValues?.FirstOrDefault() ?? string.Empty;
+            var secret = options.Value.Secret;
 
-            // Verify signature
-            var signatureResult = VerifySignature(req, options.Value.Secret, body);
-            if (signatureResult != WebhookSignatureValidationResult.Valid)
+            // Pre-validate signature/secret presence before reading the body
+            var preResult = WebhookSignatureValidator.GetPreHashValidationResult(signatureHeader, secret);
+            if (preResult.HasValue && preResult.Value != WebhookSignatureValidationResult.Valid)
             {
                 Log.SignatureValidationFailed(logger);
-                var response = req.CreateResponse(HttpStatusCode.BadRequest);
-                var message = signatureResult switch
-                {
-                    WebhookSignatureValidationResult.MissingSignature =>
-                        "Expected an X-Hub-Signature-256 header but none was provided. Configure a webhook secret on the sender, or remove the secret from the receiver.",
-                    WebhookSignatureValidationResult.MissingSecret =>
-                        "Request includes an X-Hub-Signature-256 header but no secret is configured on the receiver.",
-                    WebhookSignatureValidationResult.SignatureMismatch =>
-                        "X-Hub-Signature-256 does not match the expected signature. Verify that the webhook secret matches on both sender and receiver.",
-                    _ => "Signature validation failed.",
-                };
-                await response.WriteStringAsync(message).ConfigureAwait(false);
-                return response;
+                var errorResponse = req.CreateResponse(HttpStatusCode.BadRequest);
+                await errorResponse.WriteStringAsync(GetSignatureErrorMessage(preResult.Value)).ConfigureAwait(false);
+                return errorResponse;
             }
 
-            // Process body
+            // Set up incremental HMAC when both signature header and secret are present (preResult is null)
+            var bodyStream = req.Body;
+            if (!preResult.HasValue)
+            {
+                var keyByteCount = Encoding.UTF8.GetByteCount(secret!);
+                var keyBuffer = ArrayPool<byte>.Shared.Rent(keyByteCount);
+                try
+                {
+                    Encoding.UTF8.GetBytes(secret!, keyBuffer.AsSpan(0, keyByteCount));
+                    hmac = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, keyBuffer.AsSpan(0, keyByteCount));
+                }
+                finally
+                {
+                    keyBuffer.AsSpan(0, keyByteCount).Clear();
+                    ArrayPool<byte>.Shared.Return(keyBuffer);
+                }
+
+                bodyStream = new HashingStream(req.Body, hmac);
+            }
+
+            // Deserialize the webhook event from the stream.
+            // If using a HashingStream, the HMAC is updated incrementally as bytes are read.
             var service = ctx.InstanceServices.GetRequiredService<WebhookEventProcessor>();
             var headers = req.Headers.ToDictionary(
                 kv => kv.Key,
                 kv => new StringValues([.. kv.Value]),
                 StringComparer.OrdinalIgnoreCase);
-            await service.ProcessWebhookAsync(headers, (ReadOnlyMemory<byte>)body, ctx.CancellationToken)
+            var webhookHeaders = WebhookHeaders.Parse(headers);
+            var webhookEvent = await service.DeserializeWebhookEventAsync(webhookHeaders, bodyStream, ctx.CancellationToken)
+                .ConfigureAwait(false);
+
+            // Verify signature after the body has been fully consumed
+            if (hmac is not null)
+            {
+                var computedHash = new byte[32];
+                hmac.TryGetHashAndReset(computedHash, out _);
+
+                var result = WebhookSignatureValidator.VerifyFromHash(signatureHeader, computedHash);
+                if (result != WebhookSignatureValidationResult.Valid)
+                {
+                    Log.SignatureValidationFailed(logger);
+                    var errorResponse = req.CreateResponse(HttpStatusCode.BadRequest);
+                    await errorResponse.WriteStringAsync(GetSignatureErrorMessage(result)).ConfigureAwait(false);
+                    return errorResponse;
+                }
+            }
+
+            // Process the verified webhook event
+            await service.ProcessWebhookAsync(webhookHeaders, webhookEvent, ctx.CancellationToken)
                 .ConfigureAwait(false);
             return req.CreateResponse(HttpStatusCode.OK);
         }
@@ -83,6 +121,10 @@ public sealed partial class GitHubWebhooksHttpFunction(IOptions<GitHubWebhooksOp
         {
             Log.ProcessingFailed(logger, ex);
             return req.CreateResponse(HttpStatusCode.InternalServerError);
+        }
+        finally
+        {
+            hmac?.Dispose();
         }
     }
 
@@ -98,13 +140,6 @@ public sealed partial class GitHubWebhooksHttpFunction(IOptions<GitHubWebhooksOp
         return contentType.MediaType == expectedContentType;
     }
 
-    private static async Task<byte[]> GetBodyBytesAsync(HttpRequestData req, CancellationToken cancellationToken)
-    {
-        using var ms = new MemoryStream();
-        await req.Body.CopyToAsync(ms, cancellationToken).ConfigureAwait(false);
-        return ms.ToArray();
-    }
-
     private static bool VerifyEventType(HttpRequestData req)
     {
         if (!req.Headers.TryGetValues("X-GitHub-Event", out var eventValues))
@@ -116,13 +151,15 @@ public sealed partial class GitHubWebhooksHttpFunction(IOptions<GitHubWebhooksOp
         return values.Count == 1 && !string.IsNullOrWhiteSpace(values[0]);
     }
 
-    private static WebhookSignatureValidationResult VerifySignature(HttpRequestData req, string? secret, byte[] body)
+    private static string GetSignatureErrorMessage(WebhookSignatureValidationResult result) => result switch
     {
-        _ = req.Headers.TryGetValues("X-Hub-Signature-256", out var signatureHeader);
-        var signature = signatureHeader?.FirstOrDefault();
-
-        return WebhookSignatureValidator.Verify(signature, secret, (ReadOnlySpan<byte>)body);
-    }
+        WebhookSignatureValidationResult.MissingSignature =>
+            "Expected an X-Hub-Signature-256 header but none was provided. Configure a webhook secret on the sender, or remove the secret from the receiver.",
+        WebhookSignatureValidationResult.MissingSecret =>
+            "Request includes an X-Hub-Signature-256 header but no secret is configured on the receiver.",
+        _ =>
+            "X-Hub-Signature-256 does not match the expected signature. Verify that the webhook secret matches on both sender and receiver.",
+    };
 
     /// <summary>
     /// Log messages for the class.

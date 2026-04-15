@@ -118,6 +118,57 @@ public class WebhookEventProcessorTests
     }
 
     [Fact]
+    public async Task DeserializeWebhookEventAsync_Stream_DeserializesKnownEvent()
+    {
+        var payload = ResourceUtils.ReadResource("issues/opened.payload.json");
+        var bodyStream = new System.IO.MemoryStream(Encoding.UTF8.GetBytes(payload));
+        var headers = new WebhookHeaders
+        {
+            Event = "issues",
+            Delivery = Guid.NewGuid().ToString(),
+        };
+
+        var webhookEvent = await this.webhookEventProcessor.DeserializeWebhookEventAsync(headers, bodyStream, TestContext.Current.CancellationToken)
+            .ConfigureAwait(true);
+
+        webhookEvent.Should().BeAssignableTo<Events.IssuesEvent>();
+    }
+
+    [Fact]
+    public async Task DeserializeWebhookEventAsync_Stream_FallsBackToStringPath_WhenOverrideExists()
+    {
+        var overridingProcessor = new OverridingWebhookEventProcessor();
+        var payload = ResourceUtils.ReadResource("issues/opened.payload.json");
+        var bodyStream = new System.IO.MemoryStream(Encoding.UTF8.GetBytes(payload));
+        var headers = new WebhookHeaders
+        {
+            Event = "issues",
+            Delivery = Guid.NewGuid().ToString(),
+        };
+
+        await overridingProcessor.DeserializeWebhookEventAsync(headers, bodyStream, TestContext.Current.CancellationToken)
+            .ConfigureAwait(true);
+
+        overridingProcessor.StringDeserializeCalled.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task DeserializeWebhookEventAsync_Stream_UnknownEventType_ThrowsJsonException()
+    {
+        var bodyStream = new System.IO.MemoryStream(Encoding.UTF8.GetBytes("{}"));
+        var headers = new WebhookHeaders
+        {
+            Event = "unknown_event_type",
+        };
+
+        var act = () => this.webhookEventProcessor.DeserializeWebhookEventAsync(headers, bodyStream, TestContext.Current.CancellationToken).AsTask();
+
+        await act.Should().ThrowAsync<JsonException>()
+            .WithMessage("*'unknown_event_type'*")
+            .ConfigureAwait(true);
+    }
+
+    [Fact]
     public async Task ProcessWebhookBytesAsync_EmptyEventHeader_ThrowsArgumentException()
     {
         var headers = new Dictionary<string, StringValues>(StringComparer.OrdinalIgnoreCase)
